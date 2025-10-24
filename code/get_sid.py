@@ -12,7 +12,7 @@ def parse_args():
     # 数据路径
     parser.add_argument("--data_path", type=str, default="data/NYC/cleaned_poi_transition_matrix.npy", help="Path to POI transition matrix (.npy)")
     parser.add_argument("--embedding_path", type=str, default="data/NYC/poi_Emb_dict.pkl", help="Path to POI embedding dict (.pkl)")
-    parser.add_argument("--model_save_path", type=str, default="checkpoints/nyc_crqvae/best_crqvae.pth", help="Path to save the best model checkpoint")
+    parser.add_argument("--model_save_path", type=str, default="checkpoints/nyc_crqvae/best_crqvae_nosk.pth", help="Path to save the best model checkpoint")
     # 训练超参
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for contrastive learning")
     parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
@@ -27,12 +27,12 @@ def parse_args():
     parser.add_argument("--bn", type=bool, default=True, help="use bn or not")
     parser.add_argument("--quant_loss_weight", type=float, default=0.25, help="Weight for RQ loss (regularization)")
     parser.add_argument("--beta", type=float, default=0.25, help="Commitment loss weight inside RQ")
-    parser.add_argument("--kmeans_init", type=bool, default=True, help="use kmeans_init or not")
+    parser.add_argument("--kmeans_init", type=bool, default=False, help="use kmeans_init or not")
     parser.add_argument("--kmeans_iters", type=int, default=100, help="max kmeans iters")
-    parser.add_argument('--use_sk', type=bool, default=True, help="use sinkhorn or not")
+    parser.add_argument('--use_sk', type=bool, default=False, help="use sinkhorn or not")
     parser.add_argument('--sk_epsilons', type=float, nargs='+', default=[0.0, 0.005, 0.01], help="sinkhorn epsilons")
     parser.add_argument("--sk_iters", type=int, default=100, help="max sinkhorn iters")
-    parser.add_argument("--use-linear", type=int, default=0, help="use-linear")
+    parser.add_argument("--use-linear", type=int, default=1, help="use-linear")
     # 对比学习
     parser.add_argument("--temperature", type=float, default=0.2, help="Temperature for contrastive loss")
     parser.add_argument("--k_threshold", type=int, default=2, help="Minimum co-visit count to form a positive pair")
@@ -165,7 +165,7 @@ def get_quantization():
     
     # 保存结果到 CSV
     df = pd.DataFrame(list(poi_quantized.items()), columns=['pid', 'semitic_codes'])    
-    df.to_csv("data/NYC/poi_semitic_codes.csv", index=False)
+    df.to_csv("data/NYC/poi_semitic_codes_nosk.csv", index=False)
 
 if __name__ == "__main__":
     get_quantization()
