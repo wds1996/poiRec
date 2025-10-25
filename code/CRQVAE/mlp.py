@@ -16,18 +16,18 @@ class MLPLayers(nn.Module):
         self.use_bn = bn
 
         mlp_modules = []
-        for idx, (input_size, output_size) in enumerate(
-            zip(self.layers[:-1], self.layers[1:])
-        ):
-            mlp_modules.append(nn.Dropout(p=self.dropout))
+        for idx, (input_size, output_size) in enumerate(zip(self.layers[:-1], self.layers[1:])):
+            # mlp_modules.append(nn.Dropout(p=self.dropout))
             mlp_modules.append(nn.Linear(input_size, output_size))
 
             if self.use_bn and idx != (len(self.layers)-2):
                 mlp_modules.append(nn.BatchNorm1d(num_features=output_size))
-
-            activation_func = activation_layer(self.activation, output_size)
-            if activation_func is not None and idx != (len(self.layers)-2):
-                mlp_modules.append(activation_func)
+            if idx != len(self.layers) - 2:
+                activation_func = activation_layer(self.activation, output_size)
+                if activation_func is not None:
+                    mlp_modules.append(activation_func)
+    
+            mlp_modules.append(nn.Dropout(p=self.dropout))
 
         self.mlp_layers = nn.Sequential(*mlp_modules)
         self.apply(self.init_weights)
@@ -83,36 +83,10 @@ def kmeans(
 
 @torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
-    """标准 Sinkhorn-Knopp 算法"""
-    Q = torch.exp(-distances / epsilon)
-    Q = Q / Q.sum(dim=1, keepdim=True)  # 行归一化
+    distances = torch.clamp(distances, min=-1e3, max=1e3)
+    Q = torch.exp(-distances / (epsilon + 1e-8))
+    Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-8)
     for _ in range(sinkhorn_iterations):
-        Q = Q / Q.sum(dim=0, keepdim=True)  # 列归一化
-        Q = Q / Q.sum(dim=1, keepdim=True)  # 行归一化
+        Q = Q / (Q.sum(dim=0, keepdim=True) + 1e-8)
+        Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-8)
     return Q
-
-
-# @torch.no_grad()
-# def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
-#     Q = torch.exp(- distances / epsilon)
-
-#     B = Q.shape[0] # number of samples to assign
-#     K = Q.shape[1] # how many centroids per block (usually set to 256)
-
-#     # make the matrix sums to 1
-#     sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
-#     Q /= sum_Q
-#     # print(Q.sum())
-#     for it in range(sinkhorn_iterations):
-
-#         # normalize each column: total weight per sample must be 1/B
-#         Q /= torch.sum(Q, dim=1, keepdim=True)
-#         Q /= B
-
-#         # normalize each row: total weight per prototype must be 1/K
-#         Q /= torch.sum(Q, dim=0, keepdim=True)
-#         Q /= K
-
-
-#     Q *= B # the colomns must sum to 1 so that Q is an assignment
-#     return Q

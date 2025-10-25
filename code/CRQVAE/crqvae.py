@@ -25,7 +25,6 @@ class CRQVAE(nn.Module):
                  sk_iters=100,
                  use_linear=0,
                  temperature=0.1,   # 对比学习温度参数
-                #  pos_pairs=None     # 正样本对 (i, j)
         ):
         super(CRQVAE, self).__init__()
 
@@ -68,12 +67,10 @@ class CRQVAE(nn.Module):
         # self.decoder = MLPLayers(layers=self.decode_layer_dims,
         #                                dropout=self.dropout_prob,bn=self.bn)
 
-    def forward(self, x, pos_mask=None):
+    def forward(self, x):
         x = self.encoder(x)
-        x_q, rq_loss, indices = self.rq(x)
-        # out = self.decoder(x_q)
-
-        return x_q, rq_loss, indices
+        x_q, rq_loss, codes = self.rq(x)
+        return x_q, rq_loss, codes
     
 
     def contrastive_loss(self, x_q, pos_mask, anchor_local_idx):
@@ -94,9 +91,11 @@ class CRQVAE(nn.Module):
         num = (exp_sim * pos_mask.float()).sum(dim=1)  # [B]
         
         # 处理无正样本的情况
-        num = torch.clamp(num, min=1e-12)
-        denom = torch.clamp(denom, min=1e-12)
-        cl_loss = -torch.log(num / denom).mean()
+        has_pos = pos_mask.any(dim=1)
+        if not has_pos.any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        cl_loss = -torch.log((num[has_pos] + 1e-12) / (denom[has_pos] + 1e-12)).mean()
         return cl_loss
 
     def compute_loss(self, x_q, rq_loss, pos_mask, anchor_local_idx):
@@ -107,12 +106,7 @@ class CRQVAE(nn.Module):
     @torch.no_grad()
     def get_indices(self, xs):
         x_e = self.encoder(xs)
-        _, _, indices = self.rq(x_e)
+        _, _, (indices, scalars) = self.rq(x_e)
+        # return indices.cpu(), scalars.cpu()  # [B, L], [B, L]
         indices_cpu = [idx.cpu().tolist() for idx in indices]
         return indices_cpu
-    
-    
-
-
-
-    

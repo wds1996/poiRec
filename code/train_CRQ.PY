@@ -59,106 +59,96 @@ def build_pos_dict(pos_pairs: np.ndarray, max_item_id: int) -> dict:
     return pos_dict
 
 def load_poi_embeddings(embedding_path: str):
-    """
-    Args:
-        embedding_path (str): Path to .pkl (dict {pid: vec}) or .npy ([N, D]) file.
-    Returns:
-        ids (List[int]): List of POI IDs, length = N
-        embeddings (torch.Tensor): Float tensor of shape [N, D]
-        num_items (int): N
-        embed_dim (int): D
-    """
     if embedding_path.endswith('.npy'):
-        # Load as numpy array
         emb_array = np.load(embedding_path)
         assert emb_array.ndim == 2, f"Expected 2D array in {embedding_path}, got {emb_array.ndim}D"
         num_items, embed_dim = emb_array.shape
-        # Implicit IDs: 0, 1, 2, ..., N-1
         ids = list(range(num_items))
         embeddings = torch.from_numpy(emb_array).float()
-        
+        id_to_idx = {i: i for i in range(num_items)}  # identity mapping
+
     elif embedding_path.endswith('.pkl'):
-        # Load as dict {pid: vector}
         with open(embedding_path, 'rb') as f:
             emb_dict = pickle.load(f)
         assert isinstance(emb_dict, dict), f"Expected dict in {embedding_path}, got {type(emb_dict)}"
         assert len(emb_dict) > 0, "Empty embedding dict!"
-        # Ensure all keys are integers
         if not all(isinstance(k, int) for k in emb_dict.keys()):
             raise ValueError("All POI IDs in .pkl must be integers.")
-        # Sort by ID to ensure deterministic order
+        
         sorted_items = sorted(emb_dict.items(), key=lambda x: x[0])
         ids = [item[0] for item in sorted_items]
         vectors = [item[1] for item in sorted_items]
-        # Infer embed_dim from first vector
-        first_vec = vectors[0]
-        if isinstance(first_vec, torch.Tensor):
-            embed_dim = first_vec.shape[0]
-        elif isinstance(first_vec, np.ndarray):
-            embed_dim = first_vec.shape[0]
-        elif isinstance(first_vec, (list, tuple)):
-            embed_dim = len(first_vec)
-        else:
-            raise ValueError(f"Unsupported vector type: {type(first_vec)}")
-        # Convert all to torch.Tensor
+        
         tensor_list = []
         for vec in vectors:
             if isinstance(vec, torch.Tensor):
                 t = vec.float()
             else:
                 t = torch.tensor(vec, dtype=torch.float32)
-            assert t.shape[0] == embed_dim, f"Vector dim mismatch: {t.shape[0]} vs {embed_dim}"
             tensor_list.append(t)
-        embeddings = torch.stack(tensor_list, dim=0)  # [N, D]
+        embeddings = torch.stack(tensor_list, dim=0)
         num_items = len(ids)
         embed_dim = embeddings.shape[1]
         
+        # 构建 global POI ID -> embedding row index 映射
+        id_to_idx = {pid: idx for idx, pid in enumerate(ids)}
+
     else:
         raise ValueError(f"Unsupported file format: {embedding_path}. Use .pkl or .npy")
     
-    # Final sanity check
     assert len(ids) == embeddings.shape[0], "ID list length != embedding rows"
     assert embeddings.dtype == torch.float32, "Embedding dtype must be float32"
     
-    return ids, embeddings, num_items, embed_dim
+    return ids, embeddings, num_items, embed_dim, id_to_idx
     
 class Trainer:
-    def __init__(self, model: nn.Module, embeddings: torch.Tensor, pos_dict: dict, args):
+    def __init__(self, model: nn.Module, embeddings: torch.Tensor, pos_dict: dict, id_to_idx: dict, args):
         self.model = model.to(args.device)
         self.device = args.device
         self.embeddings = embeddings.to(self.device)
         self.pos_dict = pos_dict
+        self.id_to_idx = id_to_idx
         self.batch_size = args.batch_size
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         self.num_items = embeddings.shape[0]
         self.model_save_path = args.model_save_path
-        self.best_cl_loss = float('inf')  # 初始化为无穷大
+        self.best_cl_loss = float('inf')
+
+        # Precompute valid anchors (with at least one positive)
+        self.valid_anchors = []
+        for global_id in pos_dict.keys():
+            if global_id in id_to_idx and len(pos_dict[global_id]) > 0:
+                self.valid_anchors.append(global_id)
+        if len(self.valid_anchors) == 0:
+            raise ValueError("No valid anchors with positive pairs found!")
 
     def _build_batch(self):
-        """高效构建 batch 和 pos_mask"""
-        # 采样 anchors
-        anchors = np.random.choice(self.num_items, size=self.batch_size, replace=False)
+        # 采样 global POI IDs
+        anchors = np.random.choice(self.valid_anchors, size=self.batch_size, replace=True)
         
-        # 收集所有可能的 items: anchors + 所有正样本
-        all_items_set = set(anchors.tolist())
+        # 收集所有涉及的 global POI IDs
+        all_global_ids = set(anchors.tolist())
         for a in anchors:
-            all_items_set.update(self.pos_dict.get(int(a), []))
-        all_items = list(all_items_set)
-        id2local = {item: idx for idx, item in enumerate(all_items)}
+            all_global_ids.update(self.pos_dict.get(int(a), []))
+        all_global_ids = list(all_global_ids)
         
-        # 构建 pos_mask: [B, N_batch]
+        # 转为 embedding indices
+        all_emb_indices = [self.id_to_idx[gid] for gid in all_global_ids]
+        # 构建 global_id -> local_index 映射（仅用于 pos_mask）
+        global_to_local = {gid: i for i, gid in enumerate(all_global_ids)}
+        
         B = len(anchors)
-        N = len(all_items)
+        N = len(all_global_ids)
         pos_mask = torch.zeros((B, N), dtype=torch.bool, device=self.device)
-        anchor_local = torch.tensor([id2local[a] for a in anchors], device=self.device)
+        anchor_local = torch.tensor([global_to_local[a] for a in anchors], device=self.device)
         
         for i, a in enumerate(anchors):
             for p in self.pos_dict.get(int(a), []):
-                if p in id2local:
-                    pos_mask[i, id2local[p]] = True
+                if p in global_to_local:
+                    pos_mask[i, global_to_local[p]] = True
         
-        batch_item_ids = torch.tensor(all_items, device=self.device)
-        return batch_item_ids, anchor_local, pos_mask
+        batch_emb_indices = torch.tensor(all_emb_indices, device=self.device)
+        return batch_emb_indices, anchor_local, pos_mask
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -224,7 +214,7 @@ if __name__ == "__main__":
     
     # 加载 embedding，自动获取维度
     print(f"\nLoading POI embeddings from {args.embedding_path}...")
-    poi_ids, poi_embeddings, NUM_ITEMS, EMBED_DIM = load_poi_embeddings(args.embedding_path)
+    poi_ids, poi_embeddings, NUM_ITEMS, EMBED_DIM, id_to_idx = load_poi_embeddings(args.embedding_path)
     print(f"Auto-detected: NUM_ITEMS = {NUM_ITEMS}, EMBED_DIM = {EMBED_DIM}")
 
     # 验证是否 L2 归一化（允许微小误差）
@@ -267,6 +257,7 @@ if __name__ == "__main__":
         model=model,
         embeddings=poi_embeddings,
         pos_dict=pos_dict,
+        id_to_idx=id_to_idx,
         args=args
     )
     trainer.fit(epochs=args.epochs)

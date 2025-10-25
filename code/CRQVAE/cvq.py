@@ -5,7 +5,6 @@ from .mlp import kmeans, sinkhorn_algorithm
 
 
 class CosineVectorQuantizer(nn.Module):
-
     def __init__(self, n_e, e_dim,
                  beta = 0.25, kmeans_init = False, kmeans_iters = 10,
                  use_sk=False, sk_epsilon=None, sk_iters=100, use_linear=0):
@@ -32,89 +31,70 @@ class CosineVectorQuantizer(nn.Module):
         if use_linear == 1:
             self.codebook_projection = torch.nn.Linear(self.e_dim, self.e_dim)
             torch.nn.init.normal_(self.codebook_projection.weight, std=self.e_dim ** -0.5)
+    
 
     def get_codebook(self):
-        if self.use_linear == 1:
-            return self.codebook_projection(self.embedding.weight)
-        return self.embedding.weight
+        codebook = self.embedding.weight
+        if self.use_linear:
+            codebook = self.codebook_projection(codebook)
+        return codebook
 
-    def get_codebook_entry(self, indices, shape=None):
-        # 获取量化后的嵌入向量
-        z_q = self.embedding(indices)
-        if shape is not None:
-            z_q = z_q.view(shape)
-        return z_q
-
+    @torch.no_grad()
     def init_emb(self, data):
-        centers = kmeans(
-            data,
-            self.n_e,
-            self.kmeans_iters,
-        )
+        centers = kmeans(data, self.n_e, self.kmeans_iters)
         self.embedding.weight.data.copy_(centers)
         self.initted = True
 
     def forward(self, x):
-        # Flatten input
-        latent = x.view(-1, self.e_dim)
+        B, D = x.shape
+        latent = x.view(B, D)
+
         if not self.initted and self.training:
             self.init_emb(latent)
 
-        if self.use_linear == 1:
-            codebook = self.codebook_projection(self.embedding.weight)
-        else:
-            codebook = self.embedding.weight
+        codebook = self.get_codebook()  # [K, D]
 
-        # # Calculate the L2 Norm between latent and Embedded weights
-        # d = torch.sum(latent**2, dim=1, keepdim=True) + \
-        #     torch.sum(embeddings_weight**2, dim=1, keepdim=True).t()- \
-        #     2 * torch.matmul(latent, embeddings_weight.t())
-        # indices = torch.argmin(d, dim=-1)
-        
-        # if use_sk and self.sk_epsilon > 0:
-        #     d_soft = self.center_distance_for_constraint(d)
-        #     d_soft = d_soft.double()
-        #     Q = sinkhorn_algorithm(d_soft, self.sk_epsilon, self.sk_iters)
-        # else:
-        #     Q = F.softmax(-d, dim=-1)
-        
-        # ——————————————————————修改——————————————————————       
-        # 归一化，用余弦相似度替代欧氏距离
+        # Cosine similarity for index selection
         latent_norm = F.normalize(latent, dim=1)
         codebook_norm = F.normalize(codebook, dim=1)
-        # 相似度矩阵：B × K
-        sim = torch.matmul(latent_norm, codebook_norm.t())  # cosine similarity
-        d = 1-sim  # 越相似距离越小
-        
+        sim = torch.matmul(latent_norm, codebook_norm.t())  # [B, K]
+        distances = 1 - sim  # 越小表示越接近
+
         if self.use_sk and self.sk_epsilon is not None and self.sk_epsilon > 0:
-            d_soft = self.center_distance_for_constraint(d)
+            d_soft = self.center_distance_for_constraint(distances)
             d_soft = d_soft.double()
             Q = sinkhorn_algorithm(d_soft, self.sk_epsilon, self.sk_iters)
             if torch.isnan(Q).any():
                 print("Warning: Sinkhorn returned NaN, falling back to argmin")
-                indices = torch.argmin(d, dim=-1)
+                indices = torch.argmin(distances, dim=-1)
             else:
                 indices = torch.argmax(Q, dim=-1)
         else:
-            indices = torch.argmin(d, dim=-1)
-        # ——————————————————————修改结束——————————————————————
+            indices = torch.argmin(distances, dim=-1)
 
-        # 获取量化后的向量
-        codebook_vec = F.embedding(indices, codebook).view(x.shape)  # [B, D]
-        x_q = codebook_vec
 
-        # 量化损失
-        commitment_loss = F.mse_loss(x_q.detach(), x)
-        codebook_loss = F.mse_loss(x_q, x.detach())
+        # Get codebook vectors
+        codebook_vec = F.embedding(indices, codebook)  # [B, D]
+
+        # Compute projection scalar: w = (x · c) / ||c||^2
+        dot_product = torch.sum(latent * codebook_vec, dim=-1, keepdim=True)  # [B, 1]
+        norm_sq = torch.sum(codebook_vec * codebook_vec, dim=-1, keepdim=True)
+        scalar = dot_product / (norm_sq + 1e-8)                                # [B, 1]
+        proj_vec = scalar * codebook_vec
+
+        # Loss based on projection
+        commitment_loss = F.mse_loss(proj_vec.detach(), x)
+        codebook_loss = F.mse_loss(proj_vec, x.detach())
         loss = codebook_loss + self.beta * commitment_loss
 
-        # 直通估计器
-        x_q = x + (x_q - x).detach()
+        # Straight-through estimator
+        x_q = x + (proj_vec - x).detach()
 
-        indices = indices.view(x.shape[:-1])
+        indices = indices.view(B)        # [B]
+        scalar = scalar.view(B)          # [B]
 
-        return x_q, loss, indices, codebook_vec
-
+        return x_q, loss, indices, scalar
+    
 
     @staticmethod
     def center_distance_for_constraint(distances):
@@ -126,6 +106,3 @@ class CosineVectorQuantizer(nn.Module):
         assert amplitude > 0
         centered_distances = (distances - middle) / amplitude
         return centered_distances
-
-    
-

@@ -47,34 +47,29 @@ class ResidualVectorQuantizer(nn.Module):
 
 
     def forward(self, x):
+        x_q = torch.zeros_like(x)
+        residual = x
         all_losses = []
         all_indices = []
-        x_q = 0
-        residual = x
+        all_scalars = []
+
         for quantizer in self.vq_layers:
-            x_res, loss, indices, codebook_vec = quantizer(residual)
-            
-            # x_q = x_q + x_res
-            # residual = residual - x_res
-            
-            # 计算投影系数
-            dot_product = torch.sum(residual * codebook_vec, dim=-1, keepdim=True)
-            norm_sq = torch.sum(codebook_vec * codebook_vec, dim=-1, keepdim=True)
-            norm_sq = torch.clamp(norm_sq, min=1e-5)
-            scalar = dot_product / norm_sq  # [B, 1]
-            # 投影分量
-            projection_component = scalar * codebook_vec  # [B, D]
-            # 累积重建
+            x_res, loss, indices, scalar = quantizer(residual)
+            codebook_vec = quantizer.get_codebook()[indices]  # [B, D]
+            projection_component = scalar.unsqueeze(-1) * codebook_vec  # [B, D]
+
             x_q = x_q + projection_component
-            # 更新残差
             residual = residual - projection_component
-            
+
             all_losses.append(loss)
             all_indices.append(indices)
-        mean_losses = torch.stack(all_losses).mean()
-        all_indices = torch.stack(all_indices, dim=-1)
+            all_scalars.append(scalar)
 
-        return x_q, mean_losses, all_indices
+        mean_loss = torch.stack(all_losses).mean()
+        all_indices = torch.stack(all_indices, dim=-1)      # [B, L]
+        all_scalars = torch.stack(all_scalars, dim=-1)      # [B, L]
+
+        return x_q, mean_loss, (all_indices, all_scalars)
 
     @torch.no_grad()
     def get_codebook(self):

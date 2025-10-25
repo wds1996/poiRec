@@ -1,6 +1,6 @@
 import torch
 import pickle
-from CRQVAE.crqvae import CRQVAE
+from CRQVAE2.crqvae import CRQVAE
 import argparse
 import os
 import pandas as pd
@@ -12,7 +12,7 @@ def parse_args():
     # 数据路径
     parser.add_argument("--data_path", type=str, default="data/NYC/cleaned_poi_transition_matrix.npy", help="Path to POI transition matrix (.npy)")
     parser.add_argument("--embedding_path", type=str, default="data/NYC/poi_Emb_dict.pkl", help="Path to POI embedding dict (.pkl)")
-    parser.add_argument("--model_save_path", type=str, default="checkpoints/nyc_crqvae/best_crqvae_nosk.pth", help="Path to save the best model checkpoint")
+    parser.add_argument("--model_save_path", type=str, default="checkpoints/nyc_crqvae/best_crqvae.pth", help="Path to save the best model checkpoint")
     # 训练超参
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for contrastive learning")
     parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
