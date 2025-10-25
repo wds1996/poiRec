@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 from CRQVAE.crqvae import CRQVAE
 import pickle
+import math
 import argparse 
 
 def parse_args():
@@ -14,10 +15,10 @@ def parse_args():
     # 数据路径
     parser.add_argument("--data_path", type=str, default="data/NYC/cleaned_poi_transition_matrix.npy", help="Path to POI transition matrix (.npy)")
     parser.add_argument("--embedding_path", type=str, default="data/NYC/poi_Emb_dict.pkl", help="Path to POI embedding dict (.pkl)")
-    parser.add_argument("--model_save_path", type=str, default="checkpoints/nyc_crqvae/best_crqvae.pth", help="Path to save the best model checkpoint")
+    parser.add_argument("--model_save_path", type=str, default="checkpoints/nyc_crqvae/best_crqvae_test.pth", help="Path to save the best model checkpoint")
     # 训练超参
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for contrastive learning")
-    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help='l2 regularization weight')
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for training")
@@ -102,10 +103,11 @@ def load_poi_embeddings(embedding_path: str):
     return ids, embeddings, num_items, embed_dim, id_to_idx
     
 class Trainer:
-    def __init__(self, model: nn.Module, embeddings: torch.Tensor, pos_dict: dict, id_to_idx: dict, args):
+    def __init__(self, model: nn.Module, embeddings: torch.Tensor, pos_pairs: np.ndarray, pos_dict: dict, id_to_idx: dict, args):
         self.model = model.to(args.device)
         self.device = args.device
         self.embeddings = embeddings.to(self.device)
+        self.pos_pairs = pos_pairs
         self.pos_dict = pos_dict
         self.id_to_idx = id_to_idx
         self.batch_size = args.batch_size
@@ -121,13 +123,12 @@ class Trainer:
                 self.valid_anchors.append(global_id)
         if len(self.valid_anchors) == 0:
             raise ValueError("No valid anchors with positive pairs found!")
-
-    def _build_batch(self):
-        # 采样 global POI IDs
-        anchors = np.random.choice(self.valid_anchors, size=self.batch_size, replace=True)
         
-        # 收集所有涉及的 global POI IDs
-        all_global_ids = set(anchors.tolist())
+        self.num_pairs = len(self.pos_pairs)
+
+    def _build_batch(self, anchors):
+
+        all_global_ids = set(anchors)
         for a in anchors:
             all_global_ids.update(self.pos_dict.get(int(a), []))
         all_global_ids = list(all_global_ids)
@@ -155,30 +156,44 @@ class Trainer:
         total_loss = 0.0
         total_rq_loss = 0.0   
         total_cl_loss = 0.0   
-        num_batches = 1000  # 每 epoch 训练 1000 batches
         
-        for _ in range(num_batches):
-            # 构建 batch
-            batch_item_ids, anchor_local_idx, pos_mask = self._build_batch()
+        num_pairs = self.num_pairs
+        batch_size = self.batch_size
+        num_batches = 3 * math.ceil(num_pairs / batch_size)
+        perm = np.random.permutation(num_pairs)
+        
+        for bidx in range(num_batches):
+            start = bidx * batch_size
+            end = min((bidx + 1) * batch_size, num_pairs)
+            batch_pair_indices = perm[start:end]  # 这一小段的 pos_pairs 索引
+            # 从 pos_pairs 中取出对应的 pairs
+            pairs = self.pos_pairs[batch_pair_indices]  # shape [batch_len, 2]
+            # 取出这一 batch 的 anchors（取 unique 更稳定）
+            anchors = list(np.unique(pairs[:, 0]).tolist())
+            if len(anchors) == 0:
+                continue
+
+            # 根据 anchors 构建 batch（embedding indices, pos_mask, anchor_local）
+            batch_item_ids, anchor_local_idx, pos_mask = self._build_batch(anchors)
             batch_feats = self.embeddings[batch_item_ids]  # [N, EMBED_DIM]
-            
-            # 前向
+
+            # 前向：你的模型返回 x_q_all, rq_loss, 其它
             x_q_all, rq_loss, _ = self.model(batch_feats)
-            
-            # 计算损失
-            total_loss_batch, rq_loss, cl_loss = self.model.compute_loss(
+
+            # 计算损失（model.compute_loss 与原接口保持一致）
+            total_loss_batch, rq_loss_tensor, cl_loss_tensor = self.model.compute_loss(
                 x_q_all, rq_loss, pos_mask, anchor_local_idx
             )
-            
+
             # 反向传播
             self.optimizer.zero_grad()
             total_loss_batch.backward()
             self.optimizer.step()
-            
+
             total_loss += total_loss_batch.item()
-            total_rq_loss += rq_loss.item()
-            total_cl_loss += cl_loss.item()
-        
+            total_rq_loss += rq_loss_tensor.item()
+            total_cl_loss += cl_loss_tensor.item()
+
         avg_total_loss = total_loss / num_batches
         avg_rq_loss = total_rq_loss / num_batches
         avg_cl_loss = total_cl_loss / num_batches
@@ -189,7 +204,6 @@ class Trainer:
             # 确保父目录存在
             save_dir = os.path.dirname(self.model_save_path)
             os.makedirs(save_dir, exist_ok=True)
-
             torch.save(self.model.state_dict(), self.model_save_path)
             print(f"🎉 New best model saved at epoch {epoch} with cl_loss: {avg_cl_loss:.6f}")
 
@@ -256,6 +270,7 @@ if __name__ == "__main__":
     trainer = Trainer(
         model=model,
         embeddings=poi_embeddings,
+        pos_pairs=pos_pairs_np,
         pos_dict=pos_dict,
         id_to_idx=id_to_idx,
         args=args
